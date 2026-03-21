@@ -70,8 +70,12 @@ exports.createTicket = async (req, res) => {
     await ticket.save();
 
     // Email to creator
-    await sendTicketCreatedEmail(creator.email, creator.name, ticket);
+    // await sendTicketCreatedEmail(creator.email, creator.name, ticket);
 
+
+    sendTicketCreatedEmail(creator.email, creator.name, ticket).catch(err => 
+  console.error("Email error:", err)
+);
     // If admin/tech created for user → also notify that user
     if (creator.role !== "user") {
       await createNotification({
@@ -223,8 +227,8 @@ exports.assignTicket = async (req, res) => {
 
     const reportedUser = ticket.reportedFor || ticket.createdBy;
 
-    await sendTicketAssignedEmail(technician.email, technician.name, ticket, reportedUser.name);
-    await sendStatusUpdateEmail(reportedUser.email, reportedUser.name, ticket);
+    sendTicketAssignedEmail(technician.email, technician.name, ticket, reportedUser.name).catch(err => console.error('Email error:', err));
+    sendStatusUpdateEmail(reportedUser.email, reportedUser.name, ticket).catch(err => console.error('Email error:', err));
 
     await createMultipleNotifications([
       {
@@ -329,7 +333,7 @@ exports.updateTicketStatus = async (req, res) => {
 
     // Notify the user the ticket is for
     const notifyUser = ticket.reportedFor || ticket.createdBy;
-    await sendStatusUpdateEmail(notifyUser.email, notifyUser.name, ticket);
+    sendStatusUpdateEmail(notifyUser.email, notifyUser.name, ticket).catch(err => console.error('Email error:', err));
     await createNotification({
       recipient: notifyUser._id,
       title: `Ticket ${status}`,
