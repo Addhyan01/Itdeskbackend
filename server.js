@@ -15,10 +15,14 @@ mongoose.connect(process.env.MONGO_URI)
   const authRoutes = require("./routes/authRoutes");
   const ticketRoutes = require("./routes/ticketRoutes");
   const adminRoutes = require("./routes/adminRoutes");
+    const notificationRoutes = require("./routes/notificationRoutes");
+
 
   app.use("/api/auth", authRoutes);
   app.use("/api/tickets", ticketRoutes);
   app.use("/api/admin", adminRoutes);
+  app.use("/api/notifications", notificationRoutes);
+
 
   app.get("/", (req, res) => res.json({ message: "✅ HelpDesk API Running" }))
 

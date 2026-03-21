@@ -2,61 +2,100 @@ const Ticket = require("../models/Ticket");
 const User = require("../models/User");
 const cloudinary = require("../config/cloudinary");
 const streamifier = require("streamifier");
-const {
-  sendTicketCreatedEmail,
-  sendTicketAssignedEmail,
-  sendStatusUpdateEmail,
-} = require("../services/emailService");
+const { sendTicketCreatedEmail, sendTicketAssignedEmail, sendStatusUpdateEmail } = require("../services/emailService");
+const { createNotification, createMultipleNotifications } = require("../services/notificationService");
 
-// Helper: upload buffer to cloudinary
+// Helper: upload to cloudinary
 const uploadToCloudinary = (buffer) => {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       { folder: "ticket_attachments" },
-      (error, result) => {
-        if (error) reject(error);
-        else resolve(result);
-      }
+      (error, result) => { if (error) reject(error); else resolve(result); }
     );
     streamifier.createReadStream(buffer).pipe(stream);
   });
 };
 
-// ─── USER: Create Ticket ────────────────────────────────
+// Helper: add audit log
+const addAuditLog = (ticket, action, userId, userName, note = "") => {
+  ticket.auditLog.push({ action, performedBy: userId, performedByName: userName, note });
+};
+
+// ─── CREATE TICKET ────────────────────────────────────────
 exports.createTicket = async (req, res) => {
   try {
-    const { title, description, category, priority } = req.body;
+    const { title, description, category, priority, dueDate, reportedForId } = req.body;
+    if (!title || !description) return res.status(400).json({ message: "Title and description required" });
 
-    if (!title || !description) {
-      return res.status(400).json({ message: "Title and description are required" });
+    const creator = await User.findById(req.user.id);
+
+    // reportedFor logic:
+    // User → apne liye (reportedFor = createdBy)
+    // Admin/Tech → selected user ke liye (reportedForId required)
+    let reportedFor = req.user.id; // default: self
+    if (creator.role !== "user") {
+      if (!reportedForId) return res.status(400).json({ message: "Please select the user this ticket is for" });
+      reportedFor = reportedForId;
     }
 
-    let attachments = [];
+    const reportedUser = await User.findById(reportedFor);
+    if (!reportedUser) return res.status(404).json({ message: "Reported user not found" });
 
-    // Upload files if any
+    let attachments = [];
     if (req.files && req.files.length > 0) {
       for (const file of req.files) {
         const result = await uploadToCloudinary(file.buffer);
-        attachments.push({
-          url: result.secure_url,
-          filename: file.originalname,
-        });
+        attachments.push({ url: result.secure_url, filename: file.originalname });
       }
     }
 
-    const ticket = await Ticket.create({
-      title,
-      description,
+    const ticket = new Ticket({
+      title, description,
       category: category || "Other",
       priority: priority || "Medium",
       createdBy: req.user.id,
+      createdByRole: creator.role,
+      reportedFor: reportedFor,
       attachments,
+      dueDate: dueDate || null,
+      status: "Pending",
     });
 
-    // Send email to user
-    const user = await User.findById(req.user.id);
-    if (user) {
-      await sendTicketCreatedEmail(user.email, user.name, ticket);
+    // Audit log - clearly batao kisne kisके liye banaya
+    const auditMsg = creator.role === "user"
+      ? `Ticket self-created by User: ${creator.name}`
+      : `Ticket created by ${creator.role}: ${creator.name} for User: ${reportedUser.name}`;
+
+    addAuditLog(ticket, auditMsg, req.user.id, creator.name);
+    await ticket.save();
+
+    // Email to creator
+    await sendTicketCreatedEmail(creator.email, creator.name, ticket);
+
+    // If admin/tech created for user → also notify that user
+    if (creator.role !== "user") {
+      await createNotification({
+        recipient: reportedFor,
+        title: "Ticket Created For You",
+        message: `${creator.role === "admin" ? "Admin" : "Technician"} ${creator.name} created ticket ${ticket.ticketId} for you: ${ticket.title}`,
+        type: "ticket_created",
+        ticketId: ticket._id,
+        ticketRef: ticket.ticketId,
+      });
+    }
+
+    // Notify admins if user/tech created ticket
+    if (creator.role !== "admin") {
+      const admins = await User.find({ role: "admin" });
+      const notifs = admins.map(admin => ({
+        recipient: admin._id,
+        title: "New Ticket Created",
+        message: `${creator.name} (${creator.role}) created ticket ${ticket.ticketId} for ${reportedUser.name}`,
+        type: "ticket_created",
+        ticketId: ticket._id,
+        ticketRef: ticket.ticketId,
+      }));
+      await createMultipleNotifications(notifs);
     }
 
     res.status(201).json({ message: "Ticket created successfully", ticket });
@@ -65,100 +104,146 @@ exports.createTicket = async (req, res) => {
   }
 };
 
-// ─── USER: Get My Tickets ───────────────────────────────
+// ─── GET MY TICKETS (User - tickets reported for them) ────
 exports.getMyTickets = async (req, res) => {
   try {
-    const tickets = await Ticket.find({ createdBy: req.user.id })
+    const { status, priority, category, search } = req.query;
+
+    // User dekhega wo tickets jisme wo reportedFor hai
+    const filter = { reportedFor: req.user.id };
+    if (status) filter.status = status;
+    if (priority) filter.priority = priority;
+    if (category) filter.category = category;
+    if (search) filter.$or = [
+      { title: { $regex: search, $options: "i" } },
+      { ticketId: { $regex: search, $options: "i" } },
+    ];
+
+    const tickets = await Ticket.find(filter)
+      .populate("createdBy", "name email role")
+      .populate("reportedFor", "name email")
       .populate("assignedTo", "name email")
       .sort({ createdAt: -1 });
 
-    res.json(tickets);
+    const ticketsWithSLA = tickets.map(t => ({
+      ...t.toObject(),
+      slaStatus: t.getSLAStatus(),
+      slaHours: t.getSLAHours(),
+    }));
+
+    res.json(ticketsWithSLA);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// ─── USER: Get Single Ticket ────────────────────────────
+// ─── GET SINGLE TICKET ────────────────────────────────────
 exports.getTicketById = async (req, res) => {
   try {
     const ticket = await Ticket.findById(req.params.id)
-      .populate("createdBy", "name email")
+      .populate("createdBy", "name email role")
+      .populate("reportedFor", "name email")
       .populate("assignedTo", "name email")
-      .populate("comments.author", "name");
+      .populate("comments.author", "name role")
+      .populate("auditLog.performedBy", "name role");
 
-    if (!ticket) {
-      return res.status(404).json({ message: "Ticket not found" });
-    }
-
-    // Only owner, assigned tech, or admin can view
-    const isOwner = ticket.createdBy._id.toString() === req.user.id;
-    const isAssigned = ticket.assignedTo && ticket.assignedTo._id.toString() === req.user.id;
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
 
     const user = await User.findById(req.user.id);
-    if (!isOwner && !isAssigned && user.role !== "admin") {
+    const isReportedFor = ticket.reportedFor?._id?.toString() === req.user.id;
+    const isCreator = ticket.createdBy._id.toString() === req.user.id;
+    const isAssigned = ticket.assignedTo?._id?.toString() === req.user.id;
+
+    if (!isReportedFor && !isCreator && !isAssigned && user.role !== "admin") {
       return res.status(403).json({ message: "Access denied" });
     }
 
-    res.json(ticket);
+    res.json({ ...ticket.toObject(), slaStatus: ticket.getSLAStatus(), slaHours: ticket.getSLAHours() });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// ─── ADMIN: Get All Tickets ─────────────────────────────
+// ─── GET ALL TICKETS (Admin) ──────────────────────────────
 exports.getAllTickets = async (req, res) => {
   try {
-    const { status, priority, category, page = 1, limit = 10 } = req.query;
-
+    const { status, priority, category, search, page = 1, limit = 10 } = req.query;
     const filter = {};
     if (status) filter.status = status;
     if (priority) filter.priority = priority;
     if (category) filter.category = category;
+    if (search) filter.$or = [
+      { title: { $regex: search, $options: "i" } },
+      { ticketId: { $regex: search, $options: "i" } },
+    ];
 
     const total = await Ticket.countDocuments(filter);
     const tickets = await Ticket.find(filter)
-      .populate("createdBy", "name email")
+      .populate("createdBy", "name email role")
+      .populate("reportedFor", "name email")
       .populate("assignedTo", "name email")
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(Number(limit));
 
-    res.json({ tickets, total, page: Number(page), totalPages: Math.ceil(total / limit) });
+    const ticketsWithSLA = tickets.map(t => ({
+      ...t.toObject(),
+      slaStatus: t.getSLAStatus(),
+      slaHours: t.getSLAHours(),
+    }));
+
+    res.json({ tickets: ticketsWithSLA, total, page: Number(page), totalPages: Math.ceil(total / limit) });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// ─── ADMIN: Assign Ticket to Technician ─────────────────
+// ─── ASSIGN TICKET (Admin) ────────────────────────────────
 exports.assignTicket = async (req, res) => {
   try {
-    const { technicianId } = req.body;
+    const { technicianId, dueDate } = req.body;
+    const admin = await User.findById(req.user.id);
 
     const technician = await User.findById(technicianId);
     if (!technician || technician.role !== "technician") {
       return res.status(400).json({ message: "Invalid technician" });
     }
 
-    const ticket = await Ticket.findByIdAndUpdate(
-      req.params.id,
-      { assignedTo: technicianId, status: "Assigned" },
-      { new: true }
-    ).populate("createdBy", "name email");
+    const ticket = await Ticket.findById(req.params.id)
+      .populate("createdBy", "name email")
+      .populate("reportedFor", "name email");
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
 
-    if (!ticket) {
-      return res.status(404).json({ message: "Ticket not found" });
-    }
+    ticket.assignedTo = technicianId;
+    ticket.status = "In Process";
+    if (dueDate) ticket.dueDate = dueDate;
 
-    // Email to technician
-    await sendTicketAssignedEmail(
-      technician.email,
-      technician.name,
-      ticket,
-      ticket.createdBy.name
-    );
+    addAuditLog(ticket, `Assigned to Technician: ${technician.name}`, req.user.id, admin.name, `Due: ${dueDate || "Not set"}`);
+    await ticket.save();
 
-    // Email to user about assignment
-    await sendStatusUpdateEmail(ticket.createdBy.email, ticket.createdBy.name, ticket);
+    const reportedUser = ticket.reportedFor || ticket.createdBy;
+
+    await sendTicketAssignedEmail(technician.email, technician.name, ticket, reportedUser.name);
+    await sendStatusUpdateEmail(reportedUser.email, reportedUser.name, ticket);
+
+    await createMultipleNotifications([
+      {
+        recipient: technicianId,
+        title: "New Ticket Assigned",
+        message: `Ticket ${ticket.ticketId} assigned to you. User: ${reportedUser.name}. Issue: ${ticket.title}`,
+        type: "ticket_assigned",
+        ticketId: ticket._id,
+        ticketRef: ticket.ticketId,
+      },
+      {
+        recipient: reportedUser._id,
+        title: "Technician Assigned",
+        message: `Technician ${technician.name} assigned to your ticket ${ticket.ticketId}`,
+        type: "ticket_assigned",
+        ticketId: ticket._id,
+        ticketRef: ticket.ticketId,
+      }
+    ]);
 
     res.json({ message: "Ticket assigned successfully", ticket });
   } catch (error) {
@@ -166,12 +251,43 @@ exports.assignTicket = async (req, res) => {
   }
 };
 
-// ─── TECHNICIAN: Get Assigned Tickets ───────────────────
+// ─── GET ASSIGNED TICKETS (Technician) ───────────────────
 exports.getAssignedTickets = async (req, res) => {
   try {
-    const tickets = await Ticket.find({ assignedTo: req.user.id })
-      .populate("createdBy", "name email")
+    const { status, search } = req.query;
+    const filter = { assignedTo: req.user.id };
+    if (status) filter.status = status;
+    if (search) filter.$or = [
+      { title: { $regex: search, $options: "i" } },
+      { ticketId: { $regex: search, $options: "i" } },
+    ];
+
+    const tickets = await Ticket.find(filter)
+      .populate("createdBy", "name email role")
+      .populate("reportedFor", "name email")
+      .populate("assignedTo", "name email")
       .sort({ createdAt: -1 });
+
+    const ticketsWithSLA = tickets.map(t => ({
+      ...t.toObject(),
+      slaStatus: t.getSLAStatus(),
+      slaHours: t.getSLAHours(),
+    }));
+
+    res.json(ticketsWithSLA);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// ─── GET RESOLVED TICKETS (Technician + Admin) ───────────
+exports.getResolvedTickets = async (req, res) => {
+  try {
+    const tickets = await Ticket.find({ status: { $in: ["Resolved", "Closed"] } })
+      .populate("createdBy", "name email role")
+      .populate("reportedFor", "name email")
+      .populate("assignedTo", "name email")
+      .sort({ resolvedAt: -1 });
 
     res.json(tickets);
   } catch (error) {
@@ -179,41 +295,49 @@ exports.getAssignedTickets = async (req, res) => {
   }
 };
 
-// ─── TECHNICIAN: Update Ticket Status ───────────────────
+// ─── UPDATE TICKET STATUS (Technician) ───────────────────
 exports.updateTicketStatus = async (req, res) => {
   try {
-    const { status, comment } = req.body;
+    const { status, comment, dueDate } = req.body;
+    const tech = await User.findById(req.user.id);
 
-    const validStatuses = ["In Progress", "Resolved", "Closed"];
+    const validStatuses = ["Working", "Resolved"];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({ message: "Invalid status" });
+      return res.status(400).json({ message: "Technician can only set Working or Resolved" });
     }
 
-    const ticket = await Ticket.findById(req.params.id).populate("createdBy", "name email");
+    const ticket = await Ticket.findById(req.params.id)
+      .populate("createdBy", "name email")
+      .populate("reportedFor", "name email");
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
 
-    if (!ticket) {
-      return res.status(404).json({ message: "Ticket not found" });
-    }
-
-    // Only assigned technician can update
     if (ticket.assignedTo?.toString() !== req.user.id) {
-      return res.status(403).json({ message: "Not authorized" });
+      return res.status(403).json({ message: "Not authorized - not your ticket" });
     }
 
     ticket.status = status;
-    if (status === "Resolved") {
-      ticket.resolvedAt = new Date();
-    }
+    if (status === "Resolved") ticket.resolvedAt = new Date();
+    if (dueDate) ticket.dueDate = dueDate;
 
-    // Add comment if provided
+    addAuditLog(ticket, `Status changed to ${status}`, req.user.id, tech.name, comment || "");
+
     if (comment) {
-      ticket.comments.push({ author: req.user.id, text: comment });
+      ticket.comments.push({ author: req.user.id, authorName: tech.name, authorRole: tech.role, text: comment });
     }
 
     await ticket.save();
 
-    // Notify user via email
-    await sendStatusUpdateEmail(ticket.createdBy.email, ticket.createdBy.name, ticket);
+    // Notify the user the ticket is for
+    const notifyUser = ticket.reportedFor || ticket.createdBy;
+    await sendStatusUpdateEmail(notifyUser.email, notifyUser.name, ticket);
+    await createNotification({
+      recipient: notifyUser._id,
+      title: `Ticket ${status}`,
+      message: `Your ticket ${ticket.ticketId} status changed to ${status}`,
+      type: "status_updated",
+      ticketId: ticket._id,
+      ticketRef: ticket.ticketId,
+    });
 
     res.json({ message: "Ticket updated", ticket });
   } catch (error) {
@@ -221,65 +345,204 @@ exports.updateTicketStatus = async (req, res) => {
   }
 };
 
-// ─── ADMIN: Dashboard Stats ──────────────────────────────
-exports.getDashboardStats = async (req, res) => {
+// ─── REOPEN TICKET ────────────────────────────────────────
+exports.reopenTicket = async (req, res) => {
   try {
-    const total = await Ticket.countDocuments();
-    const open = await Ticket.countDocuments({ status: "Open" });
-    const assigned = await Ticket.countDocuments({ status: "Assigned" });
-    const inProgress = await Ticket.countDocuments({ status: "In Progress" });
-    const resolved = await Ticket.countDocuments({ status: "Resolved" });
-    const closed = await Ticket.countDocuments({ status: "Closed" });
+    const { note } = req.body;
+    const user = await User.findById(req.user.id);
 
-    // Overdue: Open/Assigned tickets older than 24 hours
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const overdue = await Ticket.countDocuments({
-      status: { $in: ["Open", "Assigned"] },
-      createdAt: { $lt: oneDayAgo },
-    });
+    const ticket = await Ticket.findById(req.params.id)
+      .populate("createdBy", "name email")
+      .populate("reportedFor", "name email");
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
 
-    // Recent 5 tickets
-    const recentTickets = await Ticket.find()
-      .populate("createdBy", "name")
-      .populate("assignedTo", "name")
-      .sort({ createdAt: -1 })
-      .limit(5);
+    if (!["Resolved", "Closed"].includes(ticket.status)) {
+      return res.status(400).json({ message: "Only Resolved/Closed tickets can be reopened" });
+    }
 
-    // All technicians with their active ticket count
-    const technicians = await User.find({ role: "technician" }).select("-password");
-    const technicianStats = await Promise.all(
-      technicians.map(async (tech) => {
-        const activeCount = await Ticket.countDocuments({
-          assignedTo: tech._id,
-          status: { $in: ["Assigned", "In Progress"] },
-        });
-        return { ...tech.toObject(), activeTickets: activeCount };
-      })
-    );
+    ticket.status = "Pending";
+    ticket.assignedTo = null;
+    ticket.resolvedAt = null;
 
-    res.json({
-      stats: { total, open, assigned, inProgress, resolved, closed, overdue },
-      recentTickets,
-      technicians: technicianStats,
-    });
+    addAuditLog(ticket, `Ticket reopened by ${user.role}: ${user.name}`, req.user.id, user.name, note || "");
+    await ticket.save();
+
+    const admins = await User.find({ role: "admin" });
+    const notifs = admins.map(admin => ({
+      recipient: admin._id,
+      title: "Ticket Reopened",
+      message: `Ticket ${ticket.ticketId} reopened by ${user.name} (${user.role}). Please reassign.`,
+      type: "ticket_reopened",
+      ticketId: ticket._id,
+      ticketRef: ticket.ticketId,
+    }));
+    await createMultipleNotifications(notifs);
+
+    res.json({ message: "Ticket reopened. Admin will reassign.", ticket });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// ─── USER: Add Comment ───────────────────────────────────
+// ─── CLOSE TICKET ─────────────────────────────────────────
+exports.closeTicket = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    const ticket = await Ticket.findById(req.params.id);
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
+
+    // User can only close tickets reported for them
+    if (user.role === "user" && ticket.reportedFor?.toString() !== req.user.id) {
+      return res.status(403).json({ message: "You can only close your own tickets" });
+    }
+
+    ticket.status = "Closed";
+    ticket.closedAt = new Date();
+    addAuditLog(ticket, `Ticket closed by ${user.role}: ${user.name}`, req.user.id, user.name);
+    await ticket.save();
+
+    res.json({ message: "Ticket closed", ticket });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// ─── DELETE TICKET (Admin) ────────────────────────────────
+exports.deleteTicket = async (req, res) => {
+  try {
+    const ticket = await Ticket.findByIdAndDelete(req.params.id);
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
+    res.json({ message: "Ticket deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// ─── MODIFY TICKET (Admin) ────────────────────────────────
+exports.modifyTicket = async (req, res) => {
+  try {
+    const { title, description, category, priority, dueDate } = req.body;
+    const admin = await User.findById(req.user.id);
+
+    const ticket = await Ticket.findById(req.params.id);
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
+
+    const changes = [];
+    if (title && title !== ticket.title) { ticket.title = title; changes.push("title"); }
+    if (description && description !== ticket.description) { ticket.description = description; changes.push("description"); }
+    if (category && category !== ticket.category) { ticket.category = category; changes.push("category"); }
+    if (priority && priority !== ticket.priority) { ticket.priority = priority; changes.push("priority"); }
+    if (dueDate) { ticket.dueDate = dueDate; changes.push("dueDate"); }
+
+    addAuditLog(ticket, `Modified: ${changes.join(", ")}`, req.user.id, admin.name);
+    await ticket.save();
+
+    res.json({ message: "Ticket updated", ticket });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// ─── ADD COMMENT ──────────────────────────────────────────
 exports.addComment = async (req, res) => {
   try {
     const { text } = req.body;
-    const ticket = await Ticket.findById(req.params.id);
+    if (!text) return res.status(400).json({ message: "Comment text required" });
 
+    const user = await User.findById(req.user.id);
+    const ticket = await Ticket.findById(req.params.id)
+      .populate("reportedFor", "name email")
+      .populate("createdBy", "name email");
     if (!ticket) return res.status(404).json({ message: "Ticket not found" });
 
-    ticket.comments.push({ author: req.user.id, text });
+    // User can only comment on their own tickets
+    if (user.role === "user" && ticket.reportedFor?._id?.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    ticket.comments.push({ author: req.user.id, authorName: user.name, authorRole: user.role, text });
+    addAuditLog(ticket, `Comment by ${user.role}: ${user.name}`, req.user.id, user.name);
     await ticket.save();
+
+    const notifyUser = ticket.reportedFor || ticket.createdBy;
+    if (notifyUser._id.toString() !== req.user.id) {
+      await createNotification({
+        recipient: notifyUser._id,
+        title: "New Comment",
+        message: `${user.name} (${user.role}) commented on ticket ${ticket.ticketId}`,
+        type: "comment_added",
+        ticketId: ticket._id,
+        ticketRef: ticket.ticketId,
+      });
+    }
 
     const updated = await Ticket.findById(req.params.id).populate("comments.author", "name role");
     res.json({ message: "Comment added", comments: updated.comments });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// ─── DASHBOARD STATS ──────────────────────────────────────
+exports.getDashboardStats = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    let stats = {};
+    let recentTickets = [];
+
+    if (user.role === "admin") {
+      const [total, pending, inProcess, working, resolved, closed] = await Promise.all([
+        Ticket.countDocuments(),
+        Ticket.countDocuments({ status: "Pending" }),
+        Ticket.countDocuments({ status: "In Process" }),
+        Ticket.countDocuments({ status: "Working" }),
+        Ticket.countDocuments({ status: "Resolved" }),
+        Ticket.countDocuments({ status: "Closed" }),
+      ]);
+
+      const overdue = await Ticket.countDocuments({
+        status: { $in: ["Pending", "In Process", "Working"] },
+        dueDate: { $lt: new Date(), $ne: null },
+      });
+
+      recentTickets = await Ticket.find()
+        .populate("createdBy", "name role")
+        .populate("reportedFor", "name email")
+        .populate("assignedTo", "name")
+        .sort({ createdAt: -1 })
+        .limit(5);
+
+      const technicians = await User.find({ role: "technician" }).select("-password");
+      const techStats = await Promise.all(technicians.map(async (tech) => {
+        const active = await Ticket.countDocuments({ assignedTo: tech._id, status: { $in: ["In Process", "Working"] } });
+        const resolved = await Ticket.countDocuments({ assignedTo: tech._id, status: "Resolved" });
+        return { ...tech.toObject(), activeTickets: active, resolvedTickets: resolved };
+      }));
+
+      stats = { total, pending, inProcess, working, resolved, closed, overdue, technicians: techStats };
+
+    } else if (user.role === "technician") {
+      const [assigned, working, resolved] = await Promise.all([
+        Ticket.countDocuments({ assignedTo: req.user.id, status: "In Process" }),
+        Ticket.countDocuments({ assignedTo: req.user.id, status: "Working" }),
+        Ticket.countDocuments({ assignedTo: req.user.id, status: "Resolved" }),
+      ]);
+
+      recentTickets = await Ticket.find({ assignedTo: req.user.id })
+        .populate("createdBy", "name role")
+        .populate("reportedFor", "name email")
+        .sort({ createdAt: -1 })
+        .limit(5);
+
+      stats = { assigned, working, resolved, total: assigned + working + resolved };
+    }
+
+    const ticketsWithSLA = recentTickets.map(t => ({
+      ...t.toObject(),
+      slaStatus: t.getSLAStatus(),
+    }));
+
+    res.json({ stats, recentTickets: ticketsWithSLA });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
