@@ -58,7 +58,9 @@ router.get("/technicians-with-stats", authMiddleware, roleMiddleware("admin"), a
 });
 
 // ── Get all users (simple list) ───────────────────────────
-router.get("/users", authMiddleware, roleMiddleware("admin"), async (req, res) => {
+// router.get("/users", authMiddleware, roleMiddleware("admin"), async (req, res) => {
+  router.get("/users", authMiddleware, roleMiddleware("admin", "technician"), async (req, res) => {
+
   try {
     const users = await User.find({ role: "user" }).select("-password -__v").sort({ createdAt: -1 });
     res.json(users);
