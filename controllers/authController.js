@@ -70,10 +70,7 @@ exports.updateProfile = async (req, res) => {
     if (name) {
       user.name = name;
     }
-    // profile image update
-    // if (req.file) {
-    //   user.profilePicture = req.file.path;
-    // }
+    
 
     if (req.file) {
 
