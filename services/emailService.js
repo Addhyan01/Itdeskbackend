@@ -1,12 +1,22 @@
 const nodemailer = require("nodemailer");
 
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  // service: "gmail",
+  // auth: {
+  //   user: process.env.EMAIL_USER,
+  //   pass: process.env.EMAIL_PASS, // Gmail App Password
+  // },
+  //  family: 4,
+
+
+  host: "smtp.gmail.com",
+  port: 465,        // ← 465 use karo (SSL)
+  secure: true,     // ← true for 465
   auth: {
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS, // Gmail App Password
+    pass: process.env.EMAIL_PASS,
   },
-   family: 4,
+  family: 4, 
 });
 
 // Send ticket created email to user
